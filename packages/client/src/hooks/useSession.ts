@@ -4,7 +4,8 @@ import {
   getModelContextWindow,
 } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "../api/client";
+import { api, fetchJSON } from "../api/client";
+import { useInstallId } from "../contexts/InstallIdContext";
 import { getMessageId } from "../lib/mergeMessages";
 import { findPendingTasks } from "../lib/pendingTasks";
 import { extractSessionIdFromFileEvent } from "../lib/sessionFile";
@@ -14,6 +15,10 @@ import type {
   PermissionMode,
   SessionStatus,
 } from "../types";
+import {
+  getCachedSlashCommands,
+  setCachedSlashCommands,
+} from "./slashCommandCache";
 import {
   type FileChangeEvent,
   type ProcessStateEvent,
@@ -94,6 +99,7 @@ export function useSession(
   initialStatus?: { owner: "self"; processId: string },
   streamingMarkdownCallbacks?: StreamingMarkdownCallbacks,
 ) {
+  const { installId, isLoading: isInstallIdLoading } = useInstallId();
   // Use initial status if provided (from navigation state) to connect stream immediately
   const [status, setStatus] = useState<SessionStatus>(
     initialStatus ?? { owner: "none" },
@@ -157,6 +163,48 @@ export function useSession(
   // MCP servers available for this session (from init message)
   const [mcpServers, setMcpServers] = useState<string[]>([]);
   const lastKnownModeVersionRef = useRef<number>(0);
+  const slashHydrationAttemptRef = useRef<string | null>(null);
+
+  const hydrateSlashCommands = useCallback(
+    async (
+      provider: string | undefined,
+      ownership: SessionStatus,
+      commandsFromServer?: Array<{
+        name: string;
+        description: string;
+        argumentHint?: string;
+      }> | null,
+    ) => {
+      if (commandsFromServer?.length) {
+        const commandNames = commandsFromServer.map((command) => command.name);
+        setSlashCommands(commandNames);
+        setCachedSlashCommands(provider, projectId, commandNames);
+        return;
+      }
+
+      const cached = getCachedSlashCommands(provider, projectId);
+      if (cached.length > 0) {
+        setSlashCommands(cached);
+        return;
+      }
+
+      if (ownership.owner !== "self" || !provider) {
+        return;
+      }
+
+      try {
+        const result = await api.getProcessCommands(ownership.processId);
+        const commandNames = result.commands.map((command) => command.name);
+        if (commandNames.length > 0) {
+          setSlashCommands(commandNames);
+          setCachedSlashCommands(provider, projectId, commandNames);
+        }
+      } catch {
+        // Ignore slash command hydration failures.
+      }
+    },
+    [projectId],
+  );
 
   // Apply server mode update only if version is >= our last known version
   // This syncs both local and server mode to the confirmed value
@@ -208,11 +256,13 @@ export function useSession(
       }
       // Set slash commands from API response so the "/" button appears reliably
       // (the SSE init message that normally carries these is discarded after ~30s)
-      if (result.slashCommands?.length) {
-        setSlashCommands(result.slashCommands.map((c) => c.name));
-      }
+      void hydrateSlashCommands(
+        result.session.provider,
+        result.status,
+        result.slashCommands,
+      );
     },
-    [applyServerModeUpdate],
+    [applyServerModeUpdate, hydrateSlashCommands],
   );
 
   // Handle initial load error
@@ -236,6 +286,7 @@ export function useSession(
     setToolUseToAgent,
     setMessages,
     fetchNewMessages,
+    refreshSessionSnapshot,
     fetchSessionMetadata,
     pagination,
     loadingOlder,
@@ -246,6 +297,37 @@ export function useSession(
     onLoadComplete: handleLoadComplete,
     onLoadError: handleLoadError,
   });
+
+  useEffect(() => {
+    if (isInstallIdLoading || status.owner === "external") {
+      return;
+    }
+
+    const provider = session?.provider;
+    if (!provider || slashCommands.length > 0) {
+      return;
+    }
+
+    const attemptKey = [
+      sessionId,
+      provider,
+      installId ?? "pending-install-id",
+      status.owner,
+    ].join(":");
+    if (slashHydrationAttemptRef.current === attemptKey) {
+      return;
+    }
+    slashHydrationAttemptRef.current = attemptKey;
+    void hydrateSlashCommands(provider, status);
+  }, [
+    hydrateSlashCommands,
+    installId,
+    isInstallIdLoading,
+    session?.provider,
+    sessionId,
+    slashCommands.length,
+    status,
+  ]);
 
   // Update local mode (UI selection) and sync to server if process is active
   const setPermissionMode = useCallback(
@@ -330,6 +412,9 @@ export function useSession(
 
   // Track if we've loaded pending agents for this session
   const pendingAgentsLoadedRef = useRef<string | null>(null);
+  const pendingAgentRetryTimerRef = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
 
   // Load pending agent content on session load
   // This handles page reload while Tasks are running: loads agent content-so-far
@@ -338,13 +423,26 @@ export function useSession(
     if (loading || pendingAgentsLoadedRef.current === sessionId) return;
     if (messages.length === 0) return;
 
-    const loadPendingAgents = async () => {
-      // Mark as loaded to prevent re-running
-      pendingAgentsLoadedRef.current = sessionId;
+    let cancelled = false;
 
+    const scheduleRetry = () => {
+      if (pendingAgentRetryTimerRef.current) {
+        clearTimeout(pendingAgentRetryTimerRef.current);
+      }
+      pendingAgentRetryTimerRef.current = setTimeout(() => {
+        if (!cancelled) {
+          void loadPendingAgents();
+        }
+      }, 1000);
+    };
+
+    const loadPendingAgents = async (): Promise<void> => {
       // Find pending Tasks (tool_use without matching tool_result)
       const pendingTasks = findPendingTasks(messages);
-      if (pendingTasks.length === 0) return;
+      if (pendingTasks.length === 0) {
+        pendingAgentsLoadedRef.current = sessionId;
+        return;
+      }
 
       try {
         // Get agent mappings (toolUseId → agentId)
@@ -352,6 +450,16 @@ export function useSession(
         const mappingsMap = new Map(
           mappings.map((m) => [m.toolUseId, m.agentId]),
         );
+        if (cancelled) return;
+
+        const pendingAgentIds = pendingTasks
+          .map((task) => mappingsMap.get(task.toolUseId))
+          .filter((agentId): agentId is string => Boolean(agentId));
+
+        if (pendingAgentIds.length === 0) {
+          scheduleRetry();
+          return;
+        }
 
         // Update the toolUseToAgent state with loaded mappings
         // This allows TaskRenderer to access agentContent even after page reload
@@ -366,9 +474,9 @@ export function useSession(
         });
 
         // Load content for each pending task that has an agent file
-        for (const task of pendingTasks) {
-          const agentId = mappingsMap.get(task.toolUseId);
-          if (!agentId) continue;
+        let loadedAnyAgent = false;
+        for (const agentId of pendingAgentIds) {
+          if (cancelled) return;
 
           try {
             const agentData = await api.getAgentSession(
@@ -403,16 +511,32 @@ export function useSession(
                 [agentId]: agentData,
               };
             });
+            loadedAnyAgent = true;
           } catch {
             // Skip agents that can't be loaded
           }
         }
+
+        if (loadedAnyAgent) {
+          pendingAgentsLoadedRef.current = sessionId;
+          return;
+        }
+
+        scheduleRetry();
       } catch {
-        // Silent fail for agent mappings - not critical
+        scheduleRetry();
       }
     };
 
-    loadPendingAgents();
+    void loadPendingAgents();
+
+    return () => {
+      cancelled = true;
+      if (pendingAgentRetryTimerRef.current) {
+        clearTimeout(pendingAgentRetryTimerRef.current);
+        pendingAgentRetryTimerRef.current = null;
+      }
+    };
   }, [
     loading,
     messages,
@@ -462,16 +586,20 @@ export function useSession(
         return;
       }
 
-      // For owned sessions: messages come via stream stream, metadata via session-updated event
-      // No API call needed - skip file change processing entirely
-      if (status.owner === "self") {
-        return;
+      if (event.fileType === "agent-session") {
+        pendingAgentsLoadedRef.current = null;
+        if (pendingAgentRetryTimerRef.current) {
+          clearTimeout(pendingAgentRetryTimerRef.current);
+          pendingAgentRetryTimerRef.current = null;
+        }
       }
 
-      // For external/idle sessions: fetch both messages and metadata via API
+      // Owned sessions still primarily rely on stream updates, but file changes are a
+      // useful throttled safety net when the stream misses or delays an event.
+      // External/idle sessions also refresh through this path.
       throttledFetch();
     },
-    [sessionId, status.owner, throttledFetch],
+    [sessionId, throttledFetch],
   );
 
   // Handle session content updates via stream (title, messageCount, updatedAt, contextUsage)
@@ -554,7 +682,7 @@ export function useSession(
   // data because the session stream unsubscribes when ownership becomes "none" and
   // nobody triggers fetchNewMessages().
   const handleActivityReconnect = useCallback(async () => {
-    fetchNewMessages();
+    await refreshSessionSnapshot();
     try {
       const data = await api.getSessionMetadata(projectId, sessionId);
       setStatus(data.ownership);
@@ -565,7 +693,7 @@ export function useSession(
     } catch {
       // Silent fail - non-critical
     }
-  }, [projectId, sessionId, fetchNewMessages]);
+  }, [projectId, sessionId, refreshSessionSnapshot]);
 
   useFileActivity({
     onSessionStatusChange: handleSessionStatusChange,
@@ -729,7 +857,9 @@ export function useSession(
         // Extract slash_commands, tools, and mcp_servers from init messages
         if (msgType === "system" && sdkMessage.subtype === "init") {
           if (Array.isArray(sdkMessage.slash_commands)) {
-            setSlashCommands(sdkMessage.slash_commands as string[]);
+            const commandNames = sdkMessage.slash_commands as string[];
+            setSlashCommands(commandNames);
+            setCachedSlashCommands(session?.provider, projectId, commandNames);
           }
           if (Array.isArray(sdkMessage.tools)) {
             setSessionTools(sdkMessage.tools as string[]);
@@ -1007,6 +1137,7 @@ export function useSession(
       setMessages,
       setSession,
       fetchNewMessages,
+      projectId,
       session?.provider,
     ],
   );

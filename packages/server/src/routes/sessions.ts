@@ -23,14 +23,21 @@ import type { ModelInfoService } from "../services/ModelInfoService.js";
 import type { ServerSettingsService } from "../services/ServerSettingsService.js";
 import { CodexSessionReader } from "../sessions/codex-reader.js";
 import { cloneClaudeSession, cloneCodexSession } from "../sessions/fork.js";
-import { GeminiSessionReader } from "../sessions/gemini-reader.js";
+import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import { normalizeSession } from "../sessions/normalization.js";
 import {
   type PaginationInfo,
   sliceAtCompactBoundaries,
 } from "../sessions/pagination.js";
 import { augmentPersistedSessionMessages } from "../sessions/persisted-augments.js";
-import { findSessionSummaryAcrossProviders } from "../sessions/provider-resolution.js";
+import {
+  buildPersistedSessionResponseCacheKey,
+  getOrLoadPersistedSessionResponse,
+} from "../sessions/persisted-response-cache.js";
+import {
+  findLoadedSessionAcrossProviders,
+  findSessionSummaryAcrossProviders,
+} from "../sessions/provider-resolution.js";
 import type { ISessionReader } from "../sessions/types.js";
 import type { ExternalSessionTracker } from "../supervisor/ExternalSessionTracker.js";
 import type { Process } from "../supervisor/Process.js";
@@ -525,15 +532,21 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
   //   ?afterMessageId=<id> - incremental forward-fetch (append new messages)
   //   ?tailCompactions=<n> - return only last N compact boundaries worth of messages
   //   ?beforeMessageId=<id> - cursor for loading older chunks (used with tailCompactions)
+  //   ?maxMessages=<n> - cap the returned message count after compact-boundary slicing
   routes.get("/projects/:projectId/sessions/:sessionId", async (c) => {
     const projectId = c.req.param("projectId");
     const sessionId = c.req.param("sessionId");
     const afterMessageId = c.req.query("afterMessageId");
     const tailCompactionsParam = c.req.query("tailCompactions");
     const beforeMessageId = c.req.query("beforeMessageId");
+    const maxMessagesParam = c.req.query("maxMessages");
     const tailCompactions =
       tailCompactionsParam !== undefined
         ? Number.parseInt(tailCompactionsParam, 10)
+        : undefined;
+    const maxMessages =
+      maxMessagesParam !== undefined
+        ? Number.parseInt(maxMessagesParam, 10)
         : undefined;
 
     // Validate projectId format at API boundary
@@ -557,71 +570,27 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     // Only mark tools as "aborted" if we owned the session and know it terminated
     const wasEverOwned = deps.supervisor.wasEverOwned(sessionId);
 
-    // Always try to read from disk first (even for owned sessions)
-    const reader = deps.readerFactory(project);
-    let loadedSession = await reader.getSession(
+    const loadedSessionResult = await findLoadedSessionAcrossProviders(
+      project,
       sessionId,
       project.id,
-      afterMessageId,
       {
-        // Only include orphaned tool info if:
-        // 1. We previously owned this session (not external)
-        // 2. No active process (tools aren't potentially in progress)
-        // When we own the session, tools without results might be pending approval
+        readerFactory: deps.readerFactory,
+        codexSessionsDir: deps.codexSessionsDir,
+        codexReaderFactory: deps.codexReaderFactory,
+        geminiSessionsDir: deps.geminiSessionsDir,
+        geminiReaderFactory: deps.geminiReaderFactory,
+        geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
+      },
+      afterMessageId,
+      process?.provider,
+      undefined,
+      {
+        // 仅在我们曾拥有该会话且当前没有活跃进程时，才把孤儿工具视为终止。
         includeOrphans: wasEverOwned && !process,
       },
     );
-
-    // For Claude projects, also check for Codex sessions if primary reader didn't find it
-    // This handles mixed projects that have sessions from multiple providers
-    if (
-      !loadedSession &&
-      project.provider === "claude" &&
-      (deps.codexReaderFactory || deps.codexSessionsDir)
-    ) {
-      const codexReader =
-        deps.codexReaderFactory?.(project.path) ??
-        (deps.codexSessionsDir
-          ? new CodexSessionReader({
-              sessionsDir: deps.codexSessionsDir,
-              projectPath: project.path,
-            })
-          : null);
-      if (codexReader) {
-        loadedSession = await codexReader.getSession(
-          sessionId,
-          project.id,
-          afterMessageId,
-          { includeOrphans: wasEverOwned && !process },
-        );
-      }
-    }
-
-    // For Claude/Codex projects, also check for Gemini sessions if still not found
-    // This handles mixed projects that have sessions from multiple providers
-    if (
-      !loadedSession &&
-      (project.provider === "claude" || project.provider === "codex") &&
-      (deps.geminiReaderFactory || deps.geminiSessionsDir)
-    ) {
-      const geminiReader =
-        deps.geminiReaderFactory?.(project.path) ??
-        (deps.geminiSessionsDir
-          ? new GeminiSessionReader({
-              sessionsDir: deps.geminiSessionsDir,
-              projectPath: project.path,
-              hashToCwd: deps.geminiScanner?.getHashToCwd(),
-            })
-          : null);
-      if (geminiReader) {
-        loadedSession = await geminiReader.getSession(
-          sessionId,
-          project.id,
-          afterMessageId,
-          { includeOrphans: wasEverOwned && !process },
-        );
-      }
-    }
+    const loadedSession = loadedSessionResult?.loaded ?? null;
 
     let session = loadedSession ? normalizeSession(loadedSession) : null;
 
@@ -724,27 +693,79 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       ? deps.notificationService.hasUnread(sessionId, session.updatedAt)
       : undefined;
 
-    // Apply compact-boundary pagination if requested (BEFORE expensive augmentation)
-    // tailCompactions slices to last N compact boundaries; skip when afterMessageId is
-    // present since that's a different use case (incremental forward-fetch)
     let paginationInfo: PaginationInfo | undefined;
-    if (
-      tailCompactions !== undefined &&
-      !Number.isNaN(tailCompactions) &&
-      tailCompactions > 0 &&
-      !afterMessageId
-    ) {
-      const sliced = sliceAtCompactBoundaries(
-        session.messages,
+    const canUsePersistedResponseCache =
+      !afterMessageId && !process && !!loadedSession && !!session;
+
+    if (canUsePersistedResponseCache && loadedSession) {
+      const cacheKey = buildPersistedSessionResponseCacheKey({
+        projectId: project.id,
+        sessionId,
+        provider: loadedSession.summary.provider,
+        updatedAt: loadedSession.summary.updatedAt,
+        messageCount: loadedSession.summary.messageCount,
         tailCompactions,
         beforeMessageId,
-      );
-      session = { ...session, messages: sliced.messages };
-      paginationInfo = sliced.pagination;
-    }
+        maxMessages,
+      });
 
-    // Keep persisted rendering in lockstep with stream augmentation behavior.
-    await augmentPersistedSessionMessages(session.messages);
+      const cachedPayload = await getOrLoadPersistedSessionResponse(
+        cacheKey,
+        async () => {
+          let cachedSession = normalizeSession(loadedSession);
+          let cachedPagination: PaginationInfo | undefined;
+
+          if (
+            tailCompactions !== undefined &&
+            !Number.isNaN(tailCompactions) &&
+            tailCompactions > 0
+          ) {
+            const sliced = sliceAtCompactBoundaries(
+              cachedSession.messages,
+              tailCompactions,
+              beforeMessageId,
+              maxMessages,
+            );
+            cachedSession = { ...cachedSession, messages: sliced.messages };
+            cachedPagination = sliced.pagination;
+          }
+
+          // Keep persisted rendering in lockstep with stream augmentation behavior.
+          await augmentPersistedSessionMessages(cachedSession.messages);
+
+          return {
+            session: cachedSession,
+            messages: cachedSession.messages,
+            pagination: cachedPagination,
+          };
+        },
+      );
+
+      session = cachedPayload.session;
+      paginationInfo = cachedPayload.pagination;
+    } else {
+      // Apply compact-boundary pagination if requested (BEFORE expensive augmentation)
+      // tailCompactions slices to last N compact boundaries; skip when afterMessageId is
+      // present since that's a different use case (incremental forward-fetch)
+      if (
+        tailCompactions !== undefined &&
+        !Number.isNaN(tailCompactions) &&
+        tailCompactions > 0 &&
+        !afterMessageId
+      ) {
+        const sliced = sliceAtCompactBoundaries(
+          session.messages,
+          tailCompactions,
+          beforeMessageId,
+          maxMessages,
+        );
+        session = { ...session, messages: sliced.messages };
+        paginationInfo = sliced.pagination;
+      }
+
+      // Keep persisted rendering in lockstep with stream augmentation behavior.
+      await augmentPersistedSessionMessages(session.messages);
+    }
 
     // Override context usage with SDK-reported context window from live process
     // The reader uses hardcoded defaults; the process captures the real value at runtime

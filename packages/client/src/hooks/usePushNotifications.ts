@@ -5,6 +5,10 @@ import {
   getOrCreateBrowserProfileId,
   getServerScoped,
 } from "../lib/storageKeys";
+import {
+  PUSH_ERROR_DEV_MODE_DISABLED,
+  getPushSupportError,
+} from "./pushSupport";
 // Use Vite's base URL - in production remote build this is /remote/
 const SW_PATH = `${import.meta.env.BASE_URL}sw.js`;
 
@@ -43,12 +47,16 @@ export function usePushNotifications() {
   const [registration, setRegistration] =
     useState<ServiceWorkerRegistration | null>(null);
 
-  // Check browser API support (separate from server-side enablement)
-  const hasBrowserSupport =
-    typeof window !== "undefined" &&
-    "serviceWorker" in navigator &&
-    "PushManager" in window &&
-    "Notification" in window;
+  const browserSupportError = getPushSupportError({
+    hasWindow: typeof window !== "undefined",
+    isSecureContext:
+      typeof window !== "undefined" ? window.isSecureContext : false,
+    hasServiceWorker:
+      typeof window !== "undefined" && "serviceWorker" in navigator,
+    hasPushManager: typeof window !== "undefined" && "PushManager" in window,
+    hasNotification: typeof window !== "undefined" && "Notification" in window,
+  });
+  const hasBrowserSupport = browserSupportError === null;
 
   // Initialize: check server setting (in dev mode), then register service worker
   useEffect(() => {
@@ -63,7 +71,7 @@ export function usePushNotifications() {
           ...s,
           isSupported: false,
           isLoading: false,
-          error: "Push notifications not supported in this browser",
+          error: browserSupportError,
           browserProfileId,
         }));
         return;
@@ -82,8 +90,7 @@ export function usePushNotifications() {
               ...s,
               isSupported: false,
               isLoading: false,
-              error:
-                "Service worker disabled (enable in Settings > Development)",
+              error: PUSH_ERROR_DEV_MODE_DISABLED,
               browserProfileId,
             }));
             return;
@@ -129,7 +136,7 @@ export function usePushNotifications() {
     };
 
     init();
-  }, [hasBrowserSupport]);
+  }, [browserSupportError, hasBrowserSupport]);
 
   // Subscribe to push notifications
   const subscribe = useCallback(async () => {

@@ -5,6 +5,7 @@ import {
   type ProjectOption,
   api,
 } from "../api/client";
+import { subscribeProjectsChanged } from "../lib/projectEvents";
 import {
   type ProcessStateEvent,
   type SessionCreatedEvent,
@@ -24,6 +25,7 @@ export interface UseGlobalSessionsOptions {
   includeArchived?: boolean;
   starred?: boolean;
   includeStats?: boolean;
+  enabled?: boolean;
 }
 
 /** Default stats when no data loaded */
@@ -44,6 +46,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     includeArchived,
     starred,
     includeStats = false,
+    enabled = true,
   } = options;
   const [sessions, setSessions] = useState<GlobalSessionItem[]>([]);
   const [stats, setStats] = useState<GlobalSessionStats>(DEFAULT_STATS);
@@ -66,16 +69,29 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     includeArchived?: boolean;
     starred?: boolean;
     includeStats?: boolean;
+    enabled?: boolean;
   }>({});
 
   const fetch = useCallback(async () => {
+    if (!enabled) {
+      setSessions([]);
+      setStats(DEFAULT_STATS);
+      setProjects([]);
+      setHasMore(false);
+      setError(null);
+      setLoading(false);
+      hasInitialLoadRef.current = false;
+      return;
+    }
+
     // Reset initial load flag when options change
     const optionsChanged =
       lastFetchOptionsRef.current.projectId !== projectId ||
       lastFetchOptionsRef.current.searchQuery !== searchQuery ||
       lastFetchOptionsRef.current.includeArchived !== includeArchived ||
       lastFetchOptionsRef.current.starred !== starred ||
-      lastFetchOptionsRef.current.includeStats !== includeStats;
+      lastFetchOptionsRef.current.includeStats !== includeStats ||
+      lastFetchOptionsRef.current.enabled !== enabled;
 
     if (optionsChanged) {
       hasInitialLoadRef.current = false;
@@ -88,6 +104,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       includeArchived,
       starred,
       includeStats,
+      enabled,
     };
 
     // Only show loading state on initial load
@@ -148,11 +165,19 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     } finally {
       setLoading(false);
     }
-  }, [projectId, searchQuery, limit, includeArchived, starred, includeStats]);
+  }, [
+    enabled,
+    projectId,
+    searchQuery,
+    limit,
+    includeArchived,
+    starred,
+    includeStats,
+  ]);
 
   // Load more sessions (pagination)
   const loadMore = useCallback(async () => {
-    if (!hasMore || sessions.length === 0) return;
+    if (!enabled || !hasMore || sessions.length === 0) return;
 
     const lastSession = sessions[sessions.length - 1];
     if (!lastSession) return;
@@ -187,6 +212,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     limit,
     includeArchived,
     starred,
+    enabled,
   ]);
 
   // Debounced refetch
@@ -371,6 +397,12 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     onSessionUpdated: handleSessionUpdated,
     onReconnect: fetch,
   });
+
+  useEffect(() => {
+    return subscribeProjectsChanged(() => {
+      void fetch();
+    });
+  }, [fetch]);
 
   // Initial fetch and refetch when options change
   useEffect(() => {

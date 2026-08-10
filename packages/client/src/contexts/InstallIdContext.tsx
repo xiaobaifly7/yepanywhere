@@ -5,8 +5,9 @@ import {
   useEffect,
   useState,
 } from "react";
-import { useConnection } from "../hooks/useConnection";
+import { directConnection, isRemoteClient } from "../lib/connection";
 import { setCurrentInstallId } from "../lib/storageKeys";
+import { useOptionalRemoteConnection } from "./RemoteConnectionContext";
 
 interface InstallIdContextValue {
   /** The server's installation ID (undefined while loading) */
@@ -24,23 +25,32 @@ const InstallIdContext = createContext<InstallIdContextValue>({
  * Provider that fetches and provides the server's installation ID.
  *
  * This should wrap the app (or the part of the app that needs server-scoped storage).
- * On mount, it fetches /api/server-info to get the installId.
+ * On mount, it fetches /server-info via the active connection to get the installId.
  */
 export function InstallIdProvider({ children }: { children: ReactNode }) {
-  const connection = useConnection();
+  const remoteConnection = useOptionalRemoteConnection();
   const [installId, setInstallId] = useState<string | undefined>(undefined);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
+    const connection = isRemoteClient()
+      ? (remoteConnection?.connection ?? null)
+      : directConnection;
+
+    if (!connection) {
+      return;
+    }
+    const activeConnection = connection;
+
     let cancelled = false;
 
     async function fetchInstallId() {
       try {
-        const response = await connection.fetch<{
+        const response = await activeConnection.fetch<{
           installId?: string;
           host: string;
           port: number;
-        }>("/api/server-info");
+        }>("/server-info");
 
         if (!cancelled && response.installId) {
           setInstallId(response.installId);
@@ -63,7 +73,7 @@ export function InstallIdProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [connection]);
+  }, [remoteConnection?.connection]);
 
   return (
     <InstallIdContext.Provider value={{ installId, isLoading }}>

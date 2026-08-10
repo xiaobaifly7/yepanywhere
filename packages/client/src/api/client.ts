@@ -18,6 +18,7 @@ import { authEvents } from "../lib/authEvents";
 import { getGlobalConnection, isRemoteClient } from "../lib/connection";
 import type {
   AgentSession,
+  HiddenProject,
   InputRequest,
   Message,
   PermissionMode,
@@ -358,6 +359,9 @@ export const api = {
 
   getProjects: () => fetchJSON<{ projects: Project[] }>("/projects"),
 
+  getHiddenProjects: () =>
+    fetchJSON<{ projects: HiddenProject[] }>("/projects/hidden"),
+
   /**
    * Add a project by file path.
    * Validates the path exists on disk and returns project info.
@@ -369,6 +373,21 @@ export const api = {
       body: JSON.stringify({ path }),
     }),
 
+  deleteProject: (projectId: string) =>
+    fetchJSON<{ removed: boolean; projectId: string }>(
+      `/projects/${projectId}`,
+      {
+        method: "DELETE",
+      },
+    ),
+
+  restoreProject: (projectId: string) =>
+    fetchJSON<{ restored: boolean; project: Project }>(
+      `/projects/${projectId}/restore`,
+      {
+        method: "POST",
+      },
+    ),
   getProject: (projectId: string) =>
     fetchJSON<{ project: Project }>(`/projects/${projectId}`),
 
@@ -376,7 +395,11 @@ export const api = {
     projectId: string,
     sessionId: string,
     afterMessageId?: string,
-    options?: { tailCompactions?: number; beforeMessageId?: string },
+    options?: {
+      tailCompactions?: number;
+      beforeMessageId?: string;
+      maxMessages?: number;
+    },
   ) => {
     const params = new URLSearchParams();
     if (afterMessageId) params.set("afterMessageId", afterMessageId);
@@ -384,6 +407,8 @@ export const api = {
       params.set("tailCompactions", String(options.tailCompactions));
     if (options?.beforeMessageId)
       params.set("beforeMessageId", options.beforeMessageId);
+    if (options?.maxMessages !== undefined)
+      params.set("maxMessages", String(options.maxMessages));
     const qs = params.toString();
     return fetchJSON<{
       session: Session;
@@ -543,6 +568,15 @@ export const api = {
     fetchJSON<{
       models: Array<{ id: string; name: string; description?: string }>;
     }>(`/processes/${processId}/models`),
+
+  getProcessCommands: (processId: string) =>
+    fetchJSON<{
+      commands: Array<{
+        name: string;
+        description: string;
+        argumentHint?: string;
+      }>;
+    }>(`/processes/${processId}/commands`),
 
   setProcessModel: (processId: string, model?: string) =>
     fetchJSON<{ success: boolean; model?: string }>(

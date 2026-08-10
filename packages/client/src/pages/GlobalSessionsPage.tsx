@@ -1,5 +1,5 @@
 import { ALL_PROVIDERS, type ProviderName } from "@yep-anywhere/shared";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { type GlobalSessionItem, api } from "../api/client";
 import { BulkActionBar } from "../components/BulkActionBar";
@@ -14,10 +14,12 @@ import { useGlobalSessions } from "../hooks/useGlobalSessions";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
+import { prefetchSessionLoad } from "../lib/sessionLoadCache";
 import { getSessionDisplayTitle, toUrlProjectId } from "../utils";
 
 // Long-press threshold for entering selection mode on mobile
 const LONG_PRESS_MS = 500;
+const PREFETCH_SESSION_COUNT = 8;
 
 // Status filter options
 type StatusFilter = "all" | "unread" | "starred" | "archived";
@@ -310,9 +312,34 @@ export function GlobalSessionsPage() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [isSelectionMode, setIsSelectionMode] = useState(false);
   const [isBulkActionPending, setIsBulkActionPending] = useState(false);
+  const prefetchedSessionsRef = useRef<Set<string>>(new Set());
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressSessionRef = useRef<string | null>(null);
   const touchStartPosRef = useRef<{ x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    if (loading || error || filteredSessions.length === 0) {
+      return;
+    }
+
+    const candidates = filteredSessions.slice(0, PREFETCH_SESSION_COUNT);
+
+    for (const [index, session] of candidates.entries()) {
+      if (
+        session.ownership.owner === "self" ||
+        session.activity === "in-turn"
+      ) {
+        continue;
+      }
+      if (prefetchedSessionsRef.current.has(session.id)) {
+        continue;
+      }
+      prefetchedSessionsRef.current.add(session.id);
+      void prefetchSessionLoad(session.projectId, session.id).catch(() => {
+        prefetchedSessionsRef.current.delete(session.id);
+      });
+    }
+  }, [error, filteredSessions, loading]);
 
   // Selection handlers
   const handleSelect = useCallback((sessionId: string, selected: boolean) => {

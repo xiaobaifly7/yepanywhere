@@ -10,8 +10,16 @@ import {
   mergeJSONLMessages,
   mergeStreamMessage,
 } from "../lib/mergeMessages";
+import {
+  getCachedSessionLoad,
+  getInflightSessionLoad,
+  primeSessionLoadCache,
+} from "../lib/sessionLoadCache";
 import { getProvider } from "../providers/registry";
 import type { Message, Session, SessionStatus } from "../types";
+
+const INITIAL_SESSION_TAIL_COMPACTIONS = 1;
+const INITIAL_SESSION_MAX_MESSAGES = 300;
 
 /** Content from a subagent (Task tool) */
 export interface AgentContent {
@@ -79,6 +87,8 @@ export interface UseSessionMessagesResult {
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   /** Fetch new messages incrementally (for file change events) */
   fetchNewMessages: () => Promise<void>;
+  /** Refresh full session snapshot (for foreground restore / hard resync) */
+  refreshSessionSnapshot: () => Promise<void>;
   /** Fetch session metadata only */
   fetchSessionMetadata: () => Promise<void>;
   /** Pagination info from compact-boundary-based loading */
@@ -286,55 +296,130 @@ export function useSessionMessages(
     }
   }, [processStreamMessage, processStreamSubagentMessage]);
 
+  const applyInitialSessionLoad = useCallback(
+    (data: {
+      session: Session;
+      messages: Message[];
+      ownership: SessionStatus;
+      pendingInputRequest?: unknown;
+      slashCommands?: Array<{
+        name: string;
+        description: string;
+        argumentHint?: string;
+      }> | null;
+      pagination?: PaginationInfo;
+    }) => {
+      setSession(data.session);
+      setPagination(data.pagination);
+      providerRef.current = data.session.provider;
+
+      const taggedMessages = data.messages.map((m) => ({
+        ...m,
+        _source: "jsonl" as const,
+      }));
+      updatePersistedTimestampWatermark(taggedMessages);
+      setMessages(
+        isCodexProvider(data.session.provider)
+          ? reconcileCodexLinearMessages(taggedMessages)
+          : taggedMessages,
+      );
+
+      const lastMessage = taggedMessages[taggedMessages.length - 1];
+      if (lastMessage) {
+        lastMessageIdRef.current = getMessageId(lastMessage);
+      }
+
+      initialLoadCompleteRef.current = true;
+      flushBuffer();
+      setLoading(false);
+
+      onLoadComplete?.({
+        session: data.session,
+        status: data.ownership,
+        pendingInputRequest: data.pendingInputRequest,
+        slashCommands: data.slashCommands,
+      });
+    },
+    [flushBuffer, onLoadComplete, updatePersistedTimestampWatermark],
+  );
+
+  const refreshSessionLoadFromNetwork = useCallback(
+    (data: {
+      session: Session;
+      messages: Message[];
+      ownership: SessionStatus;
+      pendingInputRequest?: unknown;
+      slashCommands?: Array<{
+        name: string;
+        description: string;
+        argumentHint?: string;
+      }> | null;
+      pagination?: PaginationInfo;
+    }) => {
+      setSession(data.session);
+      setPagination(data.pagination);
+      providerRef.current = data.session.provider;
+
+      const taggedMessages = data.messages.map((m) => ({
+        ...m,
+        _source: "jsonl" as const,
+      }));
+      updatePersistedTimestampWatermark(taggedMessages);
+      setMessages((prev) => {
+        const merged = mergeJSONLMessages(prev, taggedMessages);
+        return isCodexProvider(data.session.provider)
+          ? reconcileCodexLinearMessages(merged.messages)
+          : merged.messages;
+      });
+
+      setLoading(false);
+      onLoadComplete?.({
+        session: data.session,
+        status: data.ownership,
+        pendingInputRequest: data.pendingInputRequest,
+        slashCommands: data.slashCommands,
+      });
+    },
+    [onLoadComplete, updatePersistedTimestampWatermark],
+  );
+
   // Initial load
   useEffect(() => {
     initialLoadCompleteRef.current = false;
     streamBufferRef.current = [];
     maxPersistedTimestampMsRef.current = Number.NEGATIVE_INFINITY;
-    setLoading(true);
+    const cachedLoad = getCachedSessionLoad(projectId, sessionId);
+    const loadedFromCache = Boolean(cachedLoad);
+    setLoading(!cachedLoad);
     setAgentContent({});
 
-    api
-      .getSession(projectId, sessionId, undefined, { tailCompactions: 2 })
+    if (cachedLoad) {
+      applyInitialSessionLoad(cachedLoad);
+    }
+
+    const inflightLoad = getInflightSessionLoad(projectId, sessionId);
+    const loadPromise =
+      inflightLoad ??
+      api.getSession(projectId, sessionId, undefined, {
+        tailCompactions: INITIAL_SESSION_TAIL_COMPACTIONS,
+        maxMessages: INITIAL_SESSION_MAX_MESSAGES,
+      });
+
+    loadPromise
       .then((data) => {
-        setSession(data.session);
-        setPagination(data.pagination);
-        providerRef.current = data.session.provider;
-
-        // Tag messages from JSONL as authoritative
-        const taggedMessages = data.messages.map((m) => ({
-          ...m,
-          _source: "jsonl" as const,
-        }));
-        updatePersistedTimestampWatermark(taggedMessages);
-        setMessages(
-          isCodexProvider(data.session.provider)
-            ? reconcileCodexLinearMessages(taggedMessages)
-            : taggedMessages,
-        );
-
-        // Update lastMessageIdRef synchronously to avoid race condition:
-        // stream "connected" event calls fetchNewMessages() immediately, but the
-        // useEffect that normally updates lastMessageIdRef runs asynchronously.
-        // Without this, fetchNewMessages() would use undefined and refetch everything.
-        const lastMessage = taggedMessages[taggedMessages.length - 1];
-        if (lastMessage) {
-          lastMessageIdRef.current = getMessageId(lastMessage);
-        }
-
-        // Mark ready and flush buffer
-        initialLoadCompleteRef.current = true;
-        flushBuffer();
-
-        setLoading(false);
-
-        // Notify parent
-        onLoadComplete?.({
+        primeSessionLoadCache(projectId, sessionId, {
           session: data.session,
-          status: data.ownership,
+          messages: data.messages,
+          ownership: data.ownership,
           pendingInputRequest: data.pendingInputRequest,
           slashCommands: data.slashCommands,
+          pagination: data.pagination,
         });
+        if (loadedFromCache) {
+          refreshSessionLoadFromNetwork(data);
+          return;
+        }
+        applyInitialSessionLoad(data);
       })
       .catch((err) => {
         setLoading(false);
@@ -343,10 +428,9 @@ export function useSessionMessages(
   }, [
     projectId,
     sessionId,
-    onLoadComplete,
     onLoadError,
-    flushBuffer,
-    updatePersistedTimestampWatermark,
+    applyInitialSessionLoad,
+    refreshSessionLoadFromNetwork,
   ]);
 
   // Handle streaming content updates (from useStreamingContent)
@@ -471,6 +555,28 @@ export function useSessionMessages(
     }
   }, [projectId, sessionId, updatePersistedTimestampWatermark]);
 
+  const refreshSessionSnapshot = useCallback(async () => {
+    try {
+      const data = await api.getSession(projectId, sessionId, undefined, {
+        tailCompactions: INITIAL_SESSION_TAIL_COMPACTIONS,
+        maxMessages: INITIAL_SESSION_MAX_MESSAGES,
+      });
+
+      primeSessionLoadCache(projectId, sessionId, {
+        session: data.session,
+        messages: data.messages,
+        ownership: data.ownership,
+        pendingInputRequest: data.pendingInputRequest,
+        slashCommands: data.slashCommands,
+        pagination: data.pagination,
+      });
+
+      refreshSessionLoadFromNetwork(data);
+    } catch {
+      // Silent fail - foreground restore is best-effort
+    }
+  }, [projectId, refreshSessionLoadFromNetwork, sessionId]);
+
   // Load older messages (previous chunk before the current truncation point)
   const loadOlderMessages = useCallback(async () => {
     if (!pagination?.hasOlderMessages || !pagination.truncatedBeforeMessageId) {
@@ -479,8 +585,9 @@ export function useSessionMessages(
     setLoadingOlder(true);
     try {
       const data = await api.getSession(projectId, sessionId, undefined, {
-        tailCompactions: 2,
+        tailCompactions: INITIAL_SESSION_TAIL_COMPACTIONS,
         beforeMessageId: pagination.truncatedBeforeMessageId,
+        maxMessages: INITIAL_SESSION_MAX_MESSAGES,
       });
       setMessages((prev) => {
         const taggedOlder = data.messages.map((m) => ({
@@ -531,6 +638,7 @@ export function useSessionMessages(
     setToolUseToAgent,
     setMessages,
     fetchNewMessages,
+    refreshSessionSnapshot,
     fetchSessionMetadata,
     pagination,
     loadingOlder,

@@ -280,8 +280,9 @@ export class ExternalSessionTracker {
 
     if (!info.dirProjectId) return null;
 
-    const project = await this.scanner.getProjectBySessionDirSuffix(
+    const project = await this.resolveProjectByDirSuffix(
       info.dirProjectId,
+      "external session lookup",
     );
     if (!project) return null;
 
@@ -397,7 +398,7 @@ export class ExternalSessionTracker {
     // - projects/<hostname>/<projectId>/<sessionId>.jsonl
     // - <projectId>/<sessionId>.jsonl (when watchDir is already ~/.claude/projects)
     // - <hostname>/<projectId>/<sessionId>.jsonl (same case with hostname)
-    const parts = relativePath.split(path.sep).filter(Boolean);
+    const parts = relativePath.split(/[\\/]+/).filter(Boolean);
     if (parts.length < 2) return null;
 
     const startIdx = parts[0] === "projects" ? 1 : 0;
@@ -456,7 +457,7 @@ export class ExternalSessionTracker {
   }
 
   private extractCodexSessionId(relativePath: string): string | null {
-    const filename = relativePath.split(path.sep).pop();
+    const filename = relativePath.split(/[\\/]+/).pop();
     if (!filename || !filename.endsWith(".jsonl")) return null;
     const base = filename.slice(0, -6);
     const match = base.match(/([0-9a-fA-F-]{36})$/);
@@ -635,13 +636,11 @@ export class ExternalSessionTracker {
     if (!info.dirProjectId) return;
 
     // Convert directory format to URL format for events
-    const project = await this.scanner.getProjectBySessionDirSuffix(
+    const project = await this.resolveProjectByDirSuffix(
       info.dirProjectId,
+      "ownership change",
     );
     if (!project) {
-      console.warn(
-        `[ExternalSessionTracker] Cannot emit ownership change - project not found: ${info.dirProjectId}`,
-      );
       return;
     }
 
@@ -666,15 +665,36 @@ export class ExternalSessionTracker {
       return { id: info.projectId };
     }
     if (!info.dirProjectId) return null;
-    const project = await this.scanner.getProjectBySessionDirSuffix(
+    const project = await this.resolveProjectByDirSuffix(
       info.dirProjectId,
+      "session-created",
     );
     if (!project) {
-      console.warn(
-        `[ExternalSessionTracker] Cannot emit session-created - project not found: ${info.dirProjectId}`,
-      );
       return null;
     }
     return { id: project.id as UrlProjectId };
+  }
+
+  private async resolveProjectByDirSuffix(
+    dirProjectId: DirProjectId,
+    purpose: "ownership change" | "session-created" | "external session lookup",
+  ): Promise<{ id: UrlProjectId } | null> {
+    let project = await this.scanner.getProjectBySessionDirSuffix(dirProjectId);
+    if (project) {
+      return { id: project.id as UrlProjectId };
+    }
+
+    // File-change events can arrive before the scanner has rebuilt its snapshot
+    // for a newly discovered or reactivated project. Force one refresh and retry.
+    this.scanner.invalidateCache();
+    project = await this.scanner.getProjectBySessionDirSuffix(dirProjectId);
+    if (project) {
+      return { id: project.id as UrlProjectId };
+    }
+
+    console.warn(
+      `[ExternalSessionTracker] Cannot emit ${purpose} - project not found: ${dirProjectId}`,
+    );
+    return null;
   }
 }

@@ -17,13 +17,14 @@
  */
 
 import { type ReactNode, useEffect, useMemo, useState } from "react";
-import { Navigate, Outlet } from "react-router-dom";
+import { Navigate, Outlet, useLocation } from "react-router-dom";
 import { ConnectionBar } from "./components/ConnectionBar";
 import { FloatingActionButton } from "./components/FloatingActionButton";
 import { HostOfflineModal } from "./components/HostOfflineModal";
 import { ReloadBanner } from "./components/ReloadBanner";
 import { Modal } from "./components/ui/Modal";
-import { InboxProvider } from "./contexts/InboxContext";
+import { InboxProvider, useInboxContext } from "./contexts/InboxContext";
+import { InstallIdProvider } from "./contexts/InstallIdContext";
 import {
   RemoteConnectionProvider,
   useRemoteConnection,
@@ -38,6 +39,7 @@ import { useRemoteBasePath } from "./hooks/useRemoteBasePath";
 import { useVersion } from "./hooks/useVersion";
 import { connectionManager } from "./lib/connection";
 import { initClientLogCollection } from "./lib/diagnostics";
+import { shouldEnableInboxForPathname } from "./lib/inboxRouteActivation";
 
 interface Props {
   children: ReactNode;
@@ -205,6 +207,14 @@ export function ConnectionGate() {
  * Must be rendered inside InboxProvider.
  */
 function RemoteAppInner({ children }: Props) {
+  const location = useLocation();
+  const { setEnabled } = useInboxContext();
+  const shouldEnableInbox = shouldEnableInboxForPathname(location.pathname);
+
+  useEffect(() => {
+    setEnabled(shouldEnableInbox);
+  }, [setEnabled, shouldEnableInbox]);
+
   useNeedsAttentionBadge();
 
   return (
@@ -232,11 +242,13 @@ export function RemoteApp({ children }: Props) {
   return (
     <ToastProvider>
       <RemoteConnectionProvider>
-        <InboxProvider>
-          <SchemaValidationProvider>
-            <RemoteAppInner>{children}</RemoteAppInner>
-          </SchemaValidationProvider>
-        </InboxProvider>
+        <InstallIdProvider>
+          <InboxProvider initialEnabled={false}>
+            <SchemaValidationProvider>
+              <RemoteAppInner>{children}</RemoteAppInner>
+            </SchemaValidationProvider>
+          </InboxProvider>
+        </InstallIdProvider>
       </RemoteConnectionProvider>
     </ToastProvider>
   );

@@ -1,4 +1,11 @@
-import { access, readdir, stat } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  readFile,
+  readdir,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -25,6 +32,9 @@ export interface ScannerOptions {
   projectsDir?: string; // override for testing
   codexSessionsDir?: string; // override for testing
   geminiSessionsDir?: string; // override for testing
+  dataDir?: string; // override for persisted snapshot state
+  codexScanner?: CodexSessionScanner | null; // shared provider scanner
+  geminiScanner?: GeminiSessionScanner | null; // shared provider scanner
   enableCodex?: boolean; // whether to include Codex projects (default: true)
   enableGemini?: boolean; // whether to include Gemini projects (default: true)
   projectMetadataService?: ProjectMetadataService; // for persisting added projects
@@ -41,8 +51,16 @@ interface ProjectSnapshot {
   timestamp: number;
 }
 
+interface PersistedProjectSnapshot {
+  version: 1;
+  savedAt: string;
+  projects: Project[];
+}
+
 export class ProjectScanner {
   private projectsDir: string;
+  private dataDir: string | null;
+  private snapshotFilePath: string | null;
   private codexScanner: CodexSessionScanner | null;
   private geminiScanner: GeminiSessionScanner | null;
   private enableCodex: boolean;
@@ -52,21 +70,28 @@ export class ProjectScanner {
   private cacheDirty = true;
   private snapshot: ProjectSnapshot | null = null;
   private inFlightScan: Promise<ProjectSnapshot> | null = null;
+  private persistedSnapshotLoaded = false;
   private unsubscribeEventBus: (() => void) | null = null;
 
   constructor(options: ScannerOptions = {}) {
     this.projectsDir = options.projectsDir ?? CLAUDE_PROJECTS_DIR;
+    this.dataDir = options.dataDir ?? process.env.YEP_ANYWHERE_DATA_DIR ?? null;
+    this.snapshotFilePath = this.dataDir
+      ? join(this.dataDir, "project-snapshot.json")
+      : null;
     this.enableCodex = options.enableCodex ?? true;
     this.enableGemini = options.enableGemini ?? true;
     this.codexScanner = this.enableCodex
-      ? new CodexSessionScanner({
+      ? (options.codexScanner ??
+        new CodexSessionScanner({
           sessionsDir: options.codexSessionsDir ?? CODEX_SESSIONS_DIR,
-        })
+        }))
       : null;
     this.geminiScanner = this.enableGemini
-      ? new GeminiSessionScanner({
+      ? (options.geminiScanner ??
+        new GeminiSessionScanner({
           sessionsDir: options.geminiSessionsDir ?? GEMINI_TMP_DIR,
-        })
+        }))
       : null;
     this.projectMetadataService = options.projectMetadataService ?? null;
     this.cacheTtlMs = Math.max(0, options.cacheTtlMs ?? 5000);
@@ -99,7 +124,20 @@ export class ProjectScanner {
     this.cacheDirty = true;
   }
 
+  async prewarm(): Promise<void> {
+    await this.getSnapshot(true);
+  }
+
   private async getSnapshot(forceRefresh = false): Promise<ProjectSnapshot> {
+    if (!this.persistedSnapshotLoaded) {
+      this.persistedSnapshotLoaded = true;
+      const persisted = await this.loadPersistedSnapshot();
+      if (persisted) {
+        this.snapshot = persisted;
+        this.cacheDirty = false;
+      }
+    }
+
     const now = Date.now();
     const isFresh =
       this.snapshot &&
@@ -119,6 +157,7 @@ export class ProjectScanner {
         const snapshot = this.buildSnapshot(projects);
         this.snapshot = snapshot;
         this.cacheDirty = false;
+        void this.savePersistedSnapshot(snapshot.projects);
         return snapshot;
       })
       .finally(() => {
@@ -163,6 +202,65 @@ export class ProjectScanner {
     };
   }
 
+  private getHiddenProjectPaths(): Set<string> {
+    const hiddenPaths = new Set<string>();
+    if (!this.projectMetadataService) return hiddenPaths;
+
+    for (const metadata of Object.values(
+      this.projectMetadataService.getAllHiddenProjects(),
+    )) {
+      hiddenPaths.add(canonicalizeProjectPath(metadata.path));
+    }
+
+    return hiddenPaths;
+  }
+
+  private filterHiddenProjects(projects: Project[]): Project[] {
+    const hiddenPaths = this.getHiddenProjectPaths();
+    if (hiddenPaths.size === 0) return projects;
+
+    return projects.filter(
+      (project) => !hiddenPaths.has(canonicalizeProjectPath(project.path)),
+    );
+  }
+
+  private async loadPersistedSnapshot(): Promise<ProjectSnapshot | null> {
+    if (!this.snapshotFilePath) {
+      return null;
+    }
+    try {
+      const raw = await readFile(this.snapshotFilePath, "utf-8");
+      const parsed = JSON.parse(raw) as PersistedProjectSnapshot;
+      if (parsed.version !== 1 || !Array.isArray(parsed.projects)) {
+        return null;
+      }
+      const snapshot = this.buildSnapshot(
+        this.filterHiddenProjects(parsed.projects),
+      );
+      snapshot.timestamp = Date.now();
+      return snapshot;
+    } catch {
+      return null;
+    }
+  }
+
+  private async savePersistedSnapshot(projects: Project[]): Promise<void> {
+    if (!this.dataDir || !this.snapshotFilePath) {
+      return;
+    }
+    try {
+      await mkdir(this.dataDir, { recursive: true });
+      const payload: PersistedProjectSnapshot = {
+        version: 1,
+        savedAt: new Date().toISOString(),
+        projects,
+      };
+      await writeFile(this.snapshotFilePath, JSON.stringify(payload), "utf-8");
+    } catch {
+      // Ignore persistence failures; the in-memory snapshot still helps.
+    }
+  }
+
   private sessionDirToSuffix(sessionDir: string): string {
     // Claude session dirs live under projectsDir; codex/gemini do not.
     const relative = sessionDir.startsWith(this.projectsDir)
@@ -181,6 +279,8 @@ export class ProjectScanner {
       mergedSessionDirs: project.mergedSessionDirs
         ? [...project.mergedSessionDirs]
         : undefined,
+      hasCodexSessions: project.hasCodexSessions,
+      hasGeminiSessions: project.hasGeminiSessions,
     };
   }
 
@@ -191,11 +291,17 @@ export class ProjectScanner {
 
     // Any session file delta can affect project existence/count/lastActivity.
     this.invalidateCache();
+    if (event.provider === "codex") {
+      this.codexScanner?.invalidateCache();
+    } else if (event.provider === "gemini") {
+      this.geminiScanner?.invalidateCache();
+    }
   }
 
   private async scanProjects(): Promise<Project[]> {
     const projects: Project[] = [];
     const seenPaths = new Set<string>();
+    const hiddenPaths = this.getHiddenProjectPaths();
     // Map from normalized path to project index for cross-machine dedup
     const normalizedIndex = new Map<string, number>();
 
@@ -220,6 +326,7 @@ export class ProjectScanner {
       lastActivity: string | null,
     ) => {
       const projectPath = canonicalizeProjectPath(rawProjectPath);
+      if (hiddenPaths.has(projectPath)) return;
       if (seenPaths.has(projectPath)) return; // exact path duplicate
       seenPaths.add(projectPath);
 
@@ -268,6 +375,8 @@ export class ProjectScanner {
           name: basename(projectPath),
           sessionCount,
           sessionDir,
+          hasCodexSessions: false,
+          hasGeminiSessions: false,
           activeOwnedCount: 0, // populated by route
           activeExternalCount: 0, // populated by route
           lastActivity,
@@ -325,14 +434,22 @@ export class ProjectScanner {
       const codexProjects = await this.codexScanner.listProjects();
       for (const codexProject of codexProjects) {
         const projectPath = canonicalizeProjectPath(codexProject.path);
-        // Skip if we've already seen this path from Claude
-        if (seenPaths.has(projectPath)) continue;
+        if (hiddenPaths.has(projectPath)) continue;
+        const existing = projects.find(
+          (project) => canonicalizeProjectPath(project.path) === projectPath,
+        );
+        if (existing) {
+          existing.hasCodexSessions = true;
+          continue;
+        }
         seenPaths.add(projectPath);
         projects.push({
           ...codexProject,
           id: encodeProjectId(projectPath),
           path: projectPath,
           name: basename(projectPath),
+          hasCodexSessions: true,
+          hasGeminiSessions: false,
         });
       }
     }
@@ -345,15 +462,22 @@ export class ProjectScanner {
       const geminiProjects = await this.geminiScanner.listProjects();
       for (const geminiProject of geminiProjects) {
         const projectPath = canonicalizeProjectPath(geminiProject.path);
-        // Skip if we've already seen this path from Claude/Codex
-        // (Gemini projects with unknown hashes will have paths like "gemini:xxxxxxxx")
-        if (seenPaths.has(projectPath)) continue;
+        if (hiddenPaths.has(projectPath)) continue;
+        const existing = projects.find(
+          (project) => canonicalizeProjectPath(project.path) === projectPath,
+        );
+        if (existing) {
+          existing.hasGeminiSessions = true;
+          continue;
+        }
         seenPaths.add(projectPath);
         projects.push({
           ...geminiProject,
           id: encodeProjectId(projectPath),
           path: projectPath,
           name: basename(projectPath),
+          hasCodexSessions: false,
+          hasGeminiSessions: true,
         });
       }
     }
@@ -363,6 +487,7 @@ export class ProjectScanner {
       const addedProjects = this.projectMetadataService.getAllProjects();
       for (const metadata of Object.values(addedProjects)) {
         const projectPath = canonicalizeProjectPath(metadata.path);
+        if (hiddenPaths.has(projectPath)) continue;
         // Skip if we've already seen this path from another source
         if (seenPaths.has(projectPath)) continue;
 
@@ -383,6 +508,8 @@ export class ProjectScanner {
           name: basename(projectPath),
           sessionCount: 0,
           sessionDir: join(this.projectsDir, encodedPath),
+          hasCodexSessions: false,
+          hasGeminiSessions: false,
           activeOwnedCount: 0,
           activeExternalCount: 0,
           lastActivity: metadata.addedAt,
@@ -394,7 +521,13 @@ export class ProjectScanner {
     // Fallback: if no projects were found from any source, include the user's
     // home directory so sessions can always be created even if detection is broken
     if (projects.length === 0) {
+      if (hiddenPaths.size > 0) {
+        return projects;
+      }
       const home = homedir();
+      if (hiddenPaths.has(home)) {
+        return projects;
+      }
       const encodedPath = home.replace(/[/\\:]/g, "-");
       projects.push({
         id: encodeProjectId(home),

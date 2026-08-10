@@ -11,8 +11,16 @@
  * Unlike Claude's DAG structure, Codex sessions are linear.
  */
 
-import { readdir, stat } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { createHash } from "node:crypto";
+import {
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
 import {
   type CodexEventMsgEntry,
   type CodexFunctionCallOutputPayload,
@@ -55,6 +63,11 @@ export interface CodexSessionReaderOptions {
    * Only sessions with this cwd will be listed.
    */
   projectPath?: string;
+  /**
+   * Base data directory for persisted reader state.
+   * Defaults to ~/.yep-anywhere (or YEP_ANYWHERE_DATA_DIR when set).
+   */
+  dataDir?: string;
 }
 
 interface CodexSessionFile {
@@ -67,6 +80,28 @@ interface CodexSessionFile {
   isSubagent: boolean;
 }
 
+interface SharedSessionScanState {
+  sessionFileCache: Map<string, CodexSessionFile>;
+  sessions: CodexSessionFile[];
+  cacheTimestamp: number;
+  inFlightScan: Promise<CodexSessionFile[]> | null;
+}
+
+interface PersistedSessionScanState {
+  version: 1;
+  sessions: CodexSessionFile[];
+}
+
+interface LoadedCodexSession {
+  summary: SessionSummary;
+  data: {
+    provider: "codex" | "codex-oss";
+    session: {
+      entries: CodexSessionEntry[];
+    };
+  };
+}
+
 const CODEX_META_READ_MAX_BYTES = 1024 * 1024;
 
 /**
@@ -76,24 +111,38 @@ const CODEX_META_READ_MAX_BYTES = 1024 * 1024;
  * response_item, event_msg, and turn_context entries.
  */
 export class CodexSessionReader implements ISessionReader {
+  private static readonly sharedScanCache = new Map<
+    string,
+    SharedSessionScanState
+  >();
+  private static readonly sessionCache = new Map<
+    string,
+    { mtimeMs: number; size: number; loaded: LoadedCodexSession }
+  >();
+  private static readonly inFlightSessionLoads = new Map<
+    string,
+    Promise<LoadedCodexSession | null>
+  >();
+
   private sessionsDir: string;
   private projectPath?: string;
-
-  // Cache of session ID -> file path for quick lookups
-  private sessionFileCache: Map<string, CodexSessionFile> = new Map();
-  private cacheTimestamp = 0;
-  private readonly CACHE_TTL_MS = 5000; // 5 second cache
+  private dataDir: string | null;
+  private readonly CACHE_TTL_MS = 60000; // 60 second shared scan cache
 
   constructor(options: CodexSessionReaderOptions) {
     this.sessionsDir = options.sessionsDir;
     this.projectPath = options.projectPath
       ? canonicalizeProjectPath(options.projectPath)
       : undefined;
+    this.dataDir = options.dataDir ?? process.env.YEP_ANYWHERE_DATA_DIR ?? null;
   }
 
   invalidateCache(): void {
-    this.sessionFileCache.clear();
-    this.cacheTimestamp = 0;
+    CodexSessionReader.sharedScanCache.delete(this.getSharedCacheKey());
+    const persistentIndexPath = this.getPersistentIndexPath();
+    if (persistentIndexPath) {
+      void rm(persistentIndexPath, { force: true }).catch(() => {});
+    }
   }
 
   async listSessions(projectId: UrlProjectId): Promise<SessionSummary[]> {
@@ -130,65 +179,124 @@ export class CodexSessionReader implements ISessionReader {
   ): Promise<SessionSummary | null> {
     const sessionFile = await this.findSessionFile(sessionId);
     if (!sessionFile) return null;
+    const loaded = await this.loadSessionFromFile(sessionFile, projectId);
+    return loaded?.summary ?? null;
+  }
 
+  private async loadSessionFromFile(
+    sessionFile: CodexSessionFile,
+    projectId: UrlProjectId,
+  ): Promise<LoadedCodexSession | null> {
     try {
-      const lines = await readJsonlLines(sessionFile.filePath);
-      if (lines.length === 0 || (lines.length === 1 && !lines[0])) return null;
-      const entries: CodexSessionEntry[] = [];
-
-      for (const line of lines) {
-        const entry = parseCodexSessionEntry(line);
-        if (entry) {
-          entries.push(entry);
-        }
+      const stats = await stat(sessionFile.filePath);
+      const cacheKey = this.getSessionCacheKey(sessionFile.filePath);
+      const cached = CodexSessionReader.sessionCache.get(cacheKey);
+      if (
+        cached &&
+        cached.mtimeMs === stats.mtimeMs &&
+        cached.size === stats.size
+      ) {
+        return structuredClone(cached.loaded);
       }
 
-      if (entries.length === 0) return null;
+      const inFlight = CodexSessionReader.inFlightSessionLoads.get(cacheKey);
+      if (inFlight) {
+        const loaded = await inFlight;
+        return loaded ? structuredClone(loaded) : null;
+      }
 
-      // Extract session metadata from first entry
-      const metaEntry = entries.find((e) => e.type === "session_meta") as
-        | CodexSessionMetaEntry
-        | undefined;
-      if (!metaEntry) return null;
+      const loadPromise = (async (): Promise<LoadedCodexSession | null> => {
+        const lines = await readJsonlLines(sessionFile.filePath);
+        if (lines.length === 0 || (lines.length === 1 && !lines[0]))
+          return null;
+        const entries: CodexSessionEntry[] = [];
 
-      const stats = await stat(sessionFile.filePath);
-      const { title, fullTitle } = this.extractTitle(entries);
-      const messageCount = this.countMessages(entries);
-      const model = this.extractModel(entries);
-      const provider = this.determineProvider(metaEntry, model);
-      const turnContext = this.extractTurnContext(entries);
-      const contextUsage = this.extractContextUsage(entries, model, provider);
+        for (const line of lines) {
+          const entry = parseCodexSessionEntry(line);
+          if (entry) {
+            entries.push(entry);
+          }
+        }
 
-      // Skip sessions with no actual conversation messages
-      if (messageCount === 0) return null;
+        if (entries.length === 0) return null;
 
-      return {
-        id: sessionId,
-        projectId,
-        title,
-        fullTitle,
-        createdAt: metaEntry.payload.timestamp,
-        updatedAt: stats.mtime.toISOString(),
-        messageCount,
-        ownership: { owner: "none" },
-        contextUsage,
-        provider,
-        model,
-        originator: metaEntry.payload.originator,
-        cliVersion: metaEntry.payload.cli_version,
-        source: metaEntry.payload.source,
-        approvalPolicy: turnContext?.payload.approval_policy,
-        sandboxPolicy: turnContext?.payload.sandbox_policy
-          ? {
-              type: turnContext.payload.sandbox_policy.type,
-              networkAccess: turnContext.payload.sandbox_policy.network_access,
-              excludeTmpdirEnvVar:
-                turnContext.payload.sandbox_policy.exclude_tmpdir_env_var,
-              excludeSlashTmp:
-                turnContext.payload.sandbox_policy.exclude_slash_tmp,
-            }
-          : undefined,
-      };
+        // Extract session metadata from first entry
+        const metaEntry = entries.find((e) => e.type === "session_meta") as
+          | CodexSessionMetaEntry
+          | undefined;
+        if (!metaEntry) return null;
+
+        const { title, fullTitle } = this.extractTitle(entries);
+        const messageCount = this.countMessages(entries);
+        const model = this.extractModel(entries);
+        const provider = this.determineProvider(metaEntry, model) as
+          | "codex"
+          | "codex-oss";
+        const turnContext = this.extractTurnContext(entries);
+        const contextUsage = this.extractContextUsage(entries, model, provider);
+
+        // Skip sessions with no actual conversation messages
+        if (messageCount === 0) return null;
+
+        const summary: SessionSummary = {
+          id: sessionFile.id,
+          projectId,
+          title,
+          fullTitle,
+          createdAt: metaEntry.payload.timestamp,
+          updatedAt: stats.mtime.toISOString(),
+          messageCount,
+          ownership: { owner: "none" },
+          contextUsage,
+          provider,
+          model,
+          originator: metaEntry.payload.originator,
+          cliVersion: metaEntry.payload.cli_version,
+          source: metaEntry.payload.source,
+          approvalPolicy: turnContext?.payload.approval_policy,
+          sandboxPolicy: turnContext?.payload.sandbox_policy
+            ? {
+                type: turnContext.payload.sandbox_policy.type,
+                networkAccess:
+                  turnContext.payload.sandbox_policy.network_access,
+                excludeTmpdirEnvVar:
+                  turnContext.payload.sandbox_policy.exclude_tmpdir_env_var,
+                excludeSlashTmp:
+                  turnContext.payload.sandbox_policy.exclude_slash_tmp,
+              }
+            : undefined,
+        };
+
+        const loaded: LoadedCodexSession = {
+          summary,
+          data: {
+            provider,
+            session: {
+              entries,
+            },
+          },
+        };
+
+        CodexSessionReader.sessionCache.set(cacheKey, {
+          mtimeMs: stats.mtimeMs,
+          size: stats.size,
+          loaded,
+        });
+
+        return loaded;
+      })();
+
+      CodexSessionReader.inFlightSessionLoads.set(cacheKey, loadPromise);
+      try {
+        const loaded = await loadPromise;
+        return loaded ? structuredClone(loaded) : null;
+      } finally {
+        if (
+          CodexSessionReader.inFlightSessionLoads.get(cacheKey) === loadPromise
+        ) {
+          CodexSessionReader.inFlightSessionLoads.delete(cacheKey);
+        }
+      }
     } catch {
       return null;
     }
@@ -200,35 +308,25 @@ export class CodexSessionReader implements ISessionReader {
     afterMessageId?: string,
     _options?: GetSessionOptions,
   ): Promise<LoadedSession | null> {
-    const summary = await this.getSessionSummary(sessionId, projectId);
-    if (!summary) return null;
-
     const sessionFile = await this.findSessionFile(sessionId);
     if (!sessionFile) return null;
 
-    const lines = await readJsonlLines(sessionFile.filePath);
-
-    const entries: CodexSessionEntry[] = [];
-    for (const line of lines) {
-      const entry = parseCodexSessionEntry(line);
-      if (entry) {
-        entries.push(entry);
-      }
-    }
+    const loaded = await this.loadSessionFromFile(sessionFile, projectId);
+    if (!loaded) return null;
 
     // Filter entries if needed (for incremental fetching)
     // Note: Codex entries are not 1:1 with messages, so standard ID filtering is tricky
     // with raw format. We return all entries for now.
     // Ideally the client handles diffing/appending.
-    const finalEntries = entries;
+    const finalEntries = loaded.data.session.entries;
     if (afterMessageId) {
       // Logic to filter entries would go here if strict incremental loading is needed
     }
 
     return {
-      summary,
+      summary: loaded.summary,
       data: {
-        provider: this.determineProviderFromEntries(entries),
+        provider: loaded.data.provider,
         session: {
           entries: finalEntries,
         },
@@ -286,24 +384,57 @@ export class CodexSessionReader implements ISessionReader {
    * Scan the sessions directory and find all session files.
    */
   private async scanSessions(): Promise<CodexSessionFile[]> {
-    // Check cache
-    if (Date.now() - this.cacheTimestamp < this.CACHE_TTL_MS) {
-      return Array.from(this.sessionFileCache.values());
+    const sharedState = this.getSharedScanState();
+
+    if (Date.now() - sharedState.cacheTimestamp < this.CACHE_TTL_MS) {
+      return sharedState.sessions;
     }
 
-    const sessions: CodexSessionFile[] = [];
-    const files = await this.findJsonlFiles(this.sessionsDir);
+    if (sharedState.inFlightScan) {
+      return sharedState.inFlightScan;
+    }
 
-    for (const filePath of files) {
-      const session = await this.readSessionMeta(filePath);
-      if (session) {
-        sessions.push(session);
-        this.sessionFileCache.set(session.id, session);
+    if (sharedState.cacheTimestamp === 0) {
+      const persisted = await this.loadPersistedScan();
+      if (persisted) {
+        sharedState.sessions = persisted;
+        sharedState.sessionFileCache = new Map(
+          persisted.map((session) => [session.id, session]),
+        );
+        sharedState.cacheTimestamp = Date.now();
+        return persisted;
       }
     }
 
-    this.cacheTimestamp = Date.now();
-    return sessions.filter((session) => !session.isSubagent);
+    const scanPromise = (async () => {
+      const sessions: CodexSessionFile[] = [];
+      const sessionFileCache = new Map<string, CodexSessionFile>();
+      const files = await this.findJsonlFiles(this.sessionsDir);
+
+      for (const filePath of files) {
+        const session = await this.readSessionMeta(filePath);
+        if (session) {
+          sessions.push(session);
+          sessionFileCache.set(session.id, session);
+        }
+      }
+
+      sharedState.sessionFileCache = sessionFileCache;
+      sharedState.sessions = sessions.filter((session) => !session.isSubagent);
+      sharedState.cacheTimestamp = Date.now();
+      await this.savePersistedScan(sharedState.sessions);
+      return sharedState.sessions;
+    })();
+
+    sharedState.inFlightScan = scanPromise;
+
+    try {
+      return await scanPromise;
+    } finally {
+      if (sharedState.inFlightScan === scanPromise) {
+        sharedState.inFlightScan = null;
+      }
+    }
   }
 
   async getSessionFilePath(sessionId: string): Promise<string | null> {
@@ -338,13 +469,98 @@ export class CodexSessionReader implements ISessionReader {
   private async findSessionFile(
     sessionId: string,
   ): Promise<CodexSessionFile | null> {
+    const sharedState = this.getSharedScanState();
+
     // Check cache first
-    const cached = this.sessionFileCache.get(sessionId);
+    const cached = sharedState.sessionFileCache.get(sessionId);
     if (cached) return cached;
 
     // Scan if cache miss
     await this.scanSessions();
-    return this.sessionFileCache.get(sessionId) ?? null;
+    return sharedState.sessionFileCache.get(sessionId) ?? null;
+  }
+
+  private getSharedCacheKey(): string {
+    const resolved = resolve(this.sessionsDir);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  }
+
+  private getSessionCacheKey(filePath: string): string {
+    return process.platform === "win32" ? filePath.toLowerCase() : filePath;
+  }
+
+  private getPersistentIndexPath(): string | null {
+    if (!this.dataDir) {
+      return null;
+    }
+    const hash = createHash("sha256")
+      .update(this.getSharedCacheKey())
+      .digest("hex")
+      .slice(0, 16);
+    return join(this.dataDir, "indexes", `codex-session-files-${hash}.json`);
+  }
+
+  private async loadPersistedScan(): Promise<CodexSessionFile[] | null> {
+    const persistentIndexPath = this.getPersistentIndexPath();
+    if (!persistentIndexPath) {
+      return null;
+    }
+    try {
+      const raw = await readFile(persistentIndexPath, "utf-8");
+      const parsed = JSON.parse(raw) as PersistedSessionScanState;
+      if (parsed.version !== 1 || !Array.isArray(parsed.sessions)) {
+        return null;
+      }
+
+      const existingSessions = await Promise.all(
+        parsed.sessions.map(async (session) => {
+          try {
+            await stat(session.filePath);
+            return session;
+          } catch {
+            return null;
+          }
+        }),
+      );
+
+      return existingSessions.filter(
+        (session): session is CodexSessionFile => session !== null,
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  private async savePersistedScan(sessions: CodexSessionFile[]): Promise<void> {
+    const persistentIndexPath = this.getPersistentIndexPath();
+    if (!this.dataDir || !persistentIndexPath) {
+      return;
+    }
+    try {
+      await mkdir(join(this.dataDir, "indexes"), { recursive: true });
+      const payload: PersistedSessionScanState = {
+        version: 1,
+        sessions,
+      };
+      await writeFile(persistentIndexPath, JSON.stringify(payload), "utf-8");
+    } catch {
+      // Ignore persistence errors; the in-memory cache still helps this process.
+    }
+  }
+
+  private getSharedScanState(): SharedSessionScanState {
+    const key = this.getSharedCacheKey();
+    let state = CodexSessionReader.sharedScanCache.get(key);
+    if (!state) {
+      state = {
+        sessionFileCache: new Map<string, CodexSessionFile>(),
+        sessions: [],
+        cacheTimestamp: 0,
+        inFlightScan: null,
+      };
+      CodexSessionReader.sharedScanCache.set(key, state);
+    }
+    return state;
   }
 
   /**

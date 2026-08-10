@@ -26,8 +26,6 @@ import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import type { DraftControls } from "../hooks/useDraftPersistence";
 import { useEngagementTracking } from "../hooks/useEngagementTracking";
 import { getModelSetting, getThinkingSetting } from "../hooks/useModelSettings";
-import { useProject } from "../hooks/useProjects";
-import { useProviders } from "../hooks/useProviders";
 import { recordSessionVisit } from "../hooks/useRecentSessions";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import {
@@ -37,7 +35,9 @@ import {
 import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
 import { preprocessMessages } from "../lib/preprocessMessages";
+import { mergeFallbackSlashCommands } from "../lib/slashCommands";
 import { generateUUID } from "../lib/uuid";
+import { getProvider } from "../providers/registry";
 import { getSessionDisplayTitle } from "../utils";
 
 export function SessionPage() {
@@ -76,11 +76,30 @@ function SessionPageContent({
   projectId: string;
   sessionId: string;
 }) {
+  const decodedProjectPath = useMemo(() => {
+    try {
+      const normalized = projectId.replace(/-/g, "+").replace(/_/g, "/");
+      const padLength = (4 - (normalized.length % 4)) % 4;
+      const padded = normalized + "=".repeat(padLength);
+      const binary = atob(padded);
+      const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+      return new TextDecoder().decode(bytes);
+    } catch {
+      return null;
+    }
+  }, [projectId]);
+  const projectName = useMemo(() => {
+    if (!decodedProjectPath) return null;
+    const normalized = decodedProjectPath
+      .replace(/\\/g, "/")
+      .replace(/\/+$/, "");
+    const parts = normalized.split("/").filter(Boolean);
+    return parts.at(-1) ?? normalized;
+  }, [decodedProjectPath]);
   const { t } = useI18n();
   const { openSidebar, isWideScreen, toggleSidebar, isSidebarCollapsed } =
     useNavigationLayout();
   const basePath = useRemoteBasePath();
-  const { project } = useProject(projectId);
   const navigate = useNavigate();
   const location = useLocation();
   // Get initial status and title from navigation state (passed by NewSessionPage)
@@ -186,39 +205,41 @@ function SessionPageContent({
 
   // Sharing: check if configured (hidden unless sharing.json exists on server)
   const [sharingConfigured, setSharingConfigured] = useState(false);
-  useEffect(() => {
-    api
+  const [sharingStatusChecked, setSharingStatusChecked] = useState(false);
+  const ensureSharingStatus = useCallback(() => {
+    if (sharingStatusChecked) return;
+    setSharingStatusChecked(true);
+    void api
       .getSharingStatus()
       .then((res) => setSharingConfigured(res.configured))
       .catch(() => {});
-  }, []);
+  }, [sharingStatusChecked]);
 
   // Connection for uploads (uses WebSocket when enabled)
   const connection = useConnection();
 
   // Inject custom client-side commands alongside SDK-discovered ones
   const allSlashCommands = useMemo(() => {
+    const merged = mergeFallbackSlashCommands(
+      session?.provider ?? initialProvider,
+      slashCommands,
+    );
     if (status.owner === "self") {
-      return slashCommands.includes("model")
-        ? slashCommands
-        : ["model", ...slashCommands];
+      return merged.includes("model") ? merged : ["model", ...merged];
     }
-    return slashCommands;
-  }, [slashCommands, status.owner]);
+    return merged;
+  }, [initialProvider, session?.provider, slashCommands, status.owner]);
 
-  // Get provider capabilities based on session's provider
-  const { providers } = useProviders();
-  const currentProviderInfo = useMemo(() => {
-    if (!session?.provider) return null;
-    return providers.find((p) => p.name === session.provider) ?? null;
-  }, [providers, session?.provider]);
-  // Default to true for backwards compatibility (except slash commands)
+  const currentProvider = useMemo(
+    () => getProvider(session?.provider ?? initialProvider),
+    [initialProvider, session?.provider],
+  );
   const supportsPermissionMode =
-    currentProviderInfo?.supportsPermissionMode ?? true;
+    currentProvider.capabilities.supportsPermissionMode;
   const supportsThinkingToggle =
-    currentProviderInfo?.supportsThinkingToggle ?? true;
+    currentProvider.capabilities.supportsThinkingToggle;
   const supportsSlashCommands =
-    currentProviderInfo?.supportsSlashCommands ?? false;
+    currentProvider.capabilities.supportsSlashCommands;
 
   // Inline title editing state
   const [isEditingTitle, setIsEditingTitle] = useState(false);
@@ -723,7 +744,7 @@ function SessionPageContent({
   const isStarred = localIsStarred ?? session?.isStarred ?? false;
 
   // Update browser tab title
-  useDocumentTitle(project?.name, displayTitle);
+  useDocumentTitle(projectName ?? undefined, displayTitle);
 
   const handleStartEditingTitle = () => {
     setRenameValue(displayTitle);
@@ -924,15 +945,15 @@ function SessionPageContent({
                 </button>
               )}
               {/* Project breadcrumb */}
-              {project?.name && (
+              {projectName && (
                 <Link
                   to={`${basePath}/sessions?project=${projectId}`}
                   className="project-breadcrumb"
-                  title={project.name}
+                  title={projectName}
                 >
-                  {project.name.length > 12
-                    ? `${project.name.slice(0, 12)}...`
-                    : project.name}
+                  {projectName.length > 12
+                    ? `${projectName.slice(0, 12)}...`
+                    : projectName}
                 </Link>
               )}
               <div className="session-title-row">
@@ -1028,6 +1049,7 @@ function SessionPageContent({
                     onTerminate={handleTerminate}
                     sharingConfigured={sharingConfigured}
                     onShare={handleShare}
+                    onOpen={ensureSharingStatus}
                     useFixedPositioning
                     useEllipsisIcon
                   />
@@ -1104,7 +1126,7 @@ function SessionPageContent({
           ) : (
             <SessionMetadataProvider
               projectId={projectId}
-              projectPath={project?.path ?? null}
+              projectPath={decodedProjectPath}
               sessionId={sessionId}
             >
               <AgentContentProvider
@@ -1237,7 +1259,9 @@ function SessionPageContent({
                 onAttach={handleAttach}
                 onRemoveAttachment={handleRemoveAttachment}
                 uploadProgress={uploadProgress}
-                slashCommands={status.owner === "self" ? allSlashCommands : []}
+                slashCommands={
+                  status.owner === "external" ? [] : allSlashCommands
+                }
                 onCustomCommand={handleCustomCommand}
               />
             )}

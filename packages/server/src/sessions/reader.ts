@@ -9,6 +9,7 @@ import {
   isIdeMetadata,
   stripIdeMetadata,
 } from "@yep-anywhere/shared";
+import type { ClaudeSessionFile } from "@yep-anywhere/shared";
 import type {
   ContentBlock,
   ContextUsage,
@@ -158,6 +159,14 @@ export function computeCompactionOverhead(
  * agent sessions, orphaned tool detection, and context window tracking.
  */
 export class ClaudeSessionReader implements ISessionReader {
+  private static readonly sessionCache = new Map<
+    string,
+    { mtimeMs: number; size: number; loaded: LoadedSession }
+  >();
+  private static readonly inFlightSessionLoads = new Map<
+    string,
+    Promise<LoadedSession | null>
+  >();
   private sessionDir: string;
   private allSessionDirs: string[];
   private resolveContextWindow: (
@@ -191,13 +200,13 @@ export class ClaudeSessionReader implements ISessionReader {
           const sessionId = file.replace(".jsonl", "");
           if (seenIds.has(sessionId)) continue;
           seenIds.add(sessionId);
-          const summary = await this.getSessionSummaryFromDir(
+          const loaded = await this.loadSessionFromDir(
             dir,
             sessionId,
             projectId,
           );
-          if (summary) {
-            summaries.push(summary);
+          if (loaded) {
+            summaries.push(loaded.summary);
           }
         }
       } catch {
@@ -219,89 +228,147 @@ export class ClaudeSessionReader implements ISessionReader {
     projectId: UrlProjectId,
   ): Promise<SessionSummary | null> {
     for (const dir of this.allSessionDirs) {
-      const result = await this.getSessionSummaryFromDir(
-        dir,
-        sessionId,
-        projectId,
-      );
-      if (result) return result;
+      const result = await this.loadSessionFromDir(dir, sessionId, projectId);
+      if (result) return result.summary;
     }
     return null;
   }
 
-  private async getSessionSummaryFromDir(
+  private async loadSessionFromDir(
     dir: string,
     sessionId: string,
     projectId: UrlProjectId,
-  ): Promise<SessionSummary | null> {
+    afterMessageId?: string,
+  ): Promise<LoadedSession | null> {
     const filePath = join(dir, `${sessionId}.jsonl`);
+    return this.loadSessionFromFilePath(
+      filePath,
+      sessionId,
+      projectId,
+      afterMessageId,
+    );
+  }
 
+  private async loadSessionFromFilePath(
+    filePath: string,
+    sessionId: string,
+    projectId: UrlProjectId,
+    afterMessageId?: string,
+  ): Promise<LoadedSession | null> {
     try {
-      const content = await readFile(filePath, "utf-8");
-      const trimmed = content.trim();
-
-      // Skip empty files
-      if (!trimmed) {
-        return null;
-      }
-
-      const lines = trimmed.split("\n");
-      const messages = lines
-        .map((line) => {
-          try {
-            return JSON.parse(line) as ClaudeSessionEntry;
-          } catch {
-            return null;
-          }
-        })
-        .filter((m): m is ClaudeSessionEntry => m !== null);
-
-      // Build DAG and get active branch (filters out dead branches from rewinds, etc.)
-      const { activeBranch } = buildDag(messages);
-
-      // Filter active branch to user/assistant messages only
-      const conversationMessages = activeBranch
-        .filter(
-          (node) => node.raw.type === "user" || node.raw.type === "assistant",
-        )
-        .map((node) => node.raw);
-
-      // Skip sessions with no actual conversation messages (metadata-only files).
-      // Note: Newly created sessions may not have user/assistant messages yet (SDK writes async).
-      // These are handled separately in the projects route by adding owned processes.
-      if (conversationMessages.length === 0) {
-        return null;
-      }
-
       const stats = await stat(filePath);
-      const firstUserMessage = this.findFirstUserMessage(messages);
-      const fullTitle = firstUserMessage?.trim() || null;
-      const model = this.extractModel(conversationMessages);
+      const cacheKey = this.getSessionCacheKey(filePath);
+      const cached = ClaudeSessionReader.sessionCache.get(cacheKey);
+      if (
+        cached &&
+        cached.mtimeMs === stats.mtimeMs &&
+        cached.size === stats.size
+      ) {
+        return this.cloneLoadedSession(cached.loaded, afterMessageId);
+      }
 
-      // claude-ollama sessions use the same JSONL format but have non-Claude
-      // model IDs (e.g. "qwen3-coder-128k:latest" vs "claude-opus-4-5-20251101")
-      const provider =
-        model && !model.startsWith("claude-") ? "claude-ollama" : "claude";
+      const inFlight = ClaudeSessionReader.inFlightSessionLoads.get(cacheKey);
+      if (inFlight) {
+        const loaded = await inFlight;
+        return loaded ? this.cloneLoadedSession(loaded, afterMessageId) : null;
+      }
 
-      const contextUsage = this.extractContextUsage(
-        activeBranch.map((node) => node.raw),
-        model,
-        provider,
-      );
+      const loadPromise = (async (): Promise<LoadedSession | null> => {
+        const content = await readFile(filePath, "utf-8");
+        const trimmed = content.trim();
 
-      return {
-        id: sessionId,
-        projectId,
-        title: this.extractTitle(firstUserMessage),
-        fullTitle,
-        createdAt: stats.birthtime.toISOString(),
-        updatedAt: stats.mtime.toISOString(),
-        messageCount: conversationMessages.length,
-        ownership: { owner: "none" }, // Will be updated by Supervisor
-        contextUsage,
-        provider,
-        model,
-      };
+        // Skip empty files
+        if (!trimmed) {
+          return null;
+        }
+
+        const lines = trimmed.split("\n");
+        const messages = lines
+          .map((line) => {
+            try {
+              return JSON.parse(line) as ClaudeSessionEntry;
+            } catch {
+              return null;
+            }
+          })
+          .filter((m): m is ClaudeSessionEntry => m !== null);
+
+        // Build DAG and get active branch (filters out dead branches from rewinds, etc.)
+        const { activeBranch } = buildDag(messages);
+
+        // Filter active branch to user/assistant messages only
+        const conversationMessages = activeBranch
+          .filter(
+            (node) => node.raw.type === "user" || node.raw.type === "assistant",
+          )
+          .map((node) => node.raw);
+
+        // Skip sessions with no actual conversation messages (metadata-only files).
+        // Note: Newly created sessions may not have user/assistant messages yet (SDK writes async).
+        // These are handled separately in the projects route by adding owned processes.
+        if (conversationMessages.length === 0) {
+          return null;
+        }
+
+        const firstUserMessage = this.findFirstUserMessage(messages);
+        const fullTitle = firstUserMessage?.trim() || null;
+        const model = this.extractModel(conversationMessages);
+
+        // claude-ollama sessions use the same JSONL format but have non-Claude
+        // model IDs (e.g. "qwen3-coder-128k:latest" vs "claude-opus-4-5-20251101")
+        const provider =
+          model && !model.startsWith("claude-") ? "claude-ollama" : "claude";
+
+        const contextUsage = this.extractContextUsage(
+          activeBranch.map((node) => node.raw),
+          model,
+          provider,
+        );
+
+        const summary: SessionSummary = {
+          id: sessionId,
+          projectId,
+          title: this.extractTitle(firstUserMessage),
+          fullTitle,
+          createdAt: stats.birthtime.toISOString(),
+          updatedAt: stats.mtime.toISOString(),
+          messageCount: conversationMessages.length,
+          ownership: { owner: "none" }, // Will be updated by Supervisor
+          contextUsage,
+          provider,
+          model,
+        };
+
+        const loaded: LoadedSession = {
+          summary,
+          data: {
+            provider: summary.provider as "claude" | "claude-ollama",
+            session: {
+              messages,
+            },
+          },
+        };
+
+        ClaudeSessionReader.sessionCache.set(cacheKey, {
+          mtimeMs: stats.mtimeMs,
+          size: stats.size,
+          loaded,
+        });
+
+        return loaded;
+      })();
+
+      ClaudeSessionReader.inFlightSessionLoads.set(cacheKey, loadPromise);
+      try {
+        const loaded = await loadPromise;
+        return loaded ? this.cloneLoadedSession(loaded, afterMessageId) : null;
+      } finally {
+        if (
+          ClaudeSessionReader.inFlightSessionLoads.get(cacheKey) === loadPromise
+        ) {
+          ClaudeSessionReader.inFlightSessionLoads.delete(cacheKey);
+        }
+      }
     } catch {
       return null;
     }
@@ -313,46 +380,18 @@ export class ClaudeSessionReader implements ISessionReader {
     afterMessageId?: string,
     _options?: GetSessionOptions,
   ): Promise<LoadedSession | null> {
-    const summary = await this.getSessionSummary(sessionId, projectId);
-    if (!summary) return null;
-
-    // Find the session file across all dirs
-    const filePath = await this.findSessionFile(sessionId);
-    if (!filePath) return null;
-    const content = await readFile(filePath, "utf-8");
-    const lines = content.trim().split("\n");
-
-    const rawMessages: ClaudeSessionEntry[] = [];
-    for (const line of lines) {
-      try {
-        rawMessages.push(JSON.parse(line) as ClaudeSessionEntry);
-      } catch {
-        // Skip malformed lines
-      }
-    }
-
-    // Filter messages for incremental fetching if needed
-    // Note: Raw messages might not have UUIDs if they are old format or haven't been normalized.
-    // But typically they do.
-    let finalMessages = rawMessages;
-    if (afterMessageId) {
-      const afterIndex = rawMessages.findIndex(
-        (m) => "uuid" in m && m.uuid === afterMessageId,
+    for (const dir of this.allSessionDirs) {
+      const loaded = await this.loadSessionFromDir(
+        dir,
+        sessionId,
+        projectId,
+        afterMessageId,
       );
-      if (afterIndex !== -1) {
-        finalMessages = rawMessages.slice(afterIndex + 1);
+      if (loaded) {
+        return loaded;
       }
     }
-
-    return {
-      summary,
-      data: {
-        provider: summary.provider as "claude" | "claude-ollama",
-        session: {
-          messages: finalMessages,
-        },
-      },
-    };
+    return null;
   }
 
   /**
@@ -578,6 +617,30 @@ export class ClaudeSessionReader implements ISessionReader {
       }
     }
     return null;
+  }
+
+  private getSessionCacheKey(filePath: string): string {
+    return process.platform === "win32" ? filePath.toLowerCase() : filePath;
+  }
+
+  private cloneLoadedSession(
+    loaded: LoadedSession,
+    afterMessageId?: string,
+  ): LoadedSession {
+    const cloned = structuredClone(loaded);
+    const sessionData = cloned.data.session as ClaudeSessionFile;
+    const rawMessages = sessionData.messages as ClaudeSessionEntry[];
+    if (!afterMessageId) {
+      return cloned;
+    }
+
+    const afterIndex = rawMessages.findIndex(
+      (message) => "uuid" in message && message.uuid === afterMessageId,
+    );
+    if (afterIndex !== -1) {
+      sessionData.messages = rawMessages.slice(afterIndex + 1);
+    }
+    return cloned;
   }
 
   private findFirstUserMessage(messages: ClaudeSessionEntry[]): string | null {
